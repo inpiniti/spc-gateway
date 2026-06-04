@@ -1,0 +1,111 @@
+name: spc
+
+services:
+  spc-gateway:
+    image: spc-gateway:1.0.2
+    build:
+      context: .
+    container_name: spc-gateway
+    restart: unless-stopped
+    ports:
+      - '5070:5070'
+      - '3001:3001'
+    environment:
+      TCP_PORT: '5070'
+      HTTP_PORT: '3001'
+      CSV_ENABLED: 'false'
+      PG_ENABLED: 'true'
+      PGHOST: host.docker.internal
+      PGPORT: '5432'
+      PGDATABASE: spcdb
+      PGUSER: spc
+      PGPASSWORD: '1234'
+    extra_hosts:
+      - 'host.docker.internal:host-gateway'
+    volumes:
+      - gateway_csv:/app/csv
+    networks:
+      - spc-net
+
+  spc-api:
+    image: spc-api:1.0.1
+    build:
+      context: ../spc-api
+    container_name: spc-api
+    restart: unless-stopped
+    depends_on:
+      - spc-gateway
+      - spc-device
+    ports:
+      - '3000:3000'
+    environment:
+      PORT: '3000'
+      DEVICE_HOST: spc-device
+      DEVICE_PORT: '3002'
+      GATEWAY_HOST: spc-gateway
+      GATEWAY_HTTP_PORT: '3001'
+      PGHOST: host.docker.internal
+      PGPORT: '5432'
+      PGDATABASE: spcdb
+      PGUSER: spc
+      PGPASSWORD: '1234'
+    extra_hosts:
+      - 'host.docker.internal:host-gateway'
+    networks:
+      - spc-net
+
+  spc-device:
+    image: spc-device:1.0.1
+    build:
+      context: ../spc-device
+    container_name: spc-device
+    restart: unless-stopped
+    depends_on:
+      - spc-gateway
+    ports:
+      - '3002:3002'
+      - '5173:5173'
+    environment:
+      SERVER_PORT: '3002'
+      GATEWAY_HOST: spc-gateway
+      GATEWAY_PORT: '5070'
+      GATEWAY_HTTP: http://spc-gateway:3001
+    networks:
+      - spc-net
+
+  spc-admin:
+    image: spc-admin:1.0.0
+    build:
+      context: ../spc-admin
+      args:
+        VITE_API_BASE: http://localhost:3000
+    container_name: spc-admin
+    restart: unless-stopped
+    depends_on:
+      - spc-api
+    ports:
+      - '3003:80'
+    networks:
+      - spc-net
+
+  spc-monitor:
+    image: spc-monitor:1.0.0
+    build:
+      context: ../spc-monitor
+      args:
+        VITE_API_BASE: http://localhost:3000
+    container_name: spc-monitor
+    restart: unless-stopped
+    depends_on:
+      - spc-api
+    ports:
+      - '3004:80'
+    networks:
+      - spc-net
+
+volumes:
+  gateway_csv:
+
+networks:
+  spc-net:
+    driver: bridge

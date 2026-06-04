@@ -1,0 +1,266 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: spc
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: spc-postgres-secret
+  namespace: spc
+type: Opaque
+stringData:
+  POSTGRES_USER: spc
+  POSTGRES_PASSWORD: "1234"
+  POSTGRES_DB: spcdb
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: spc-postgres-pvc
+  namespace: spc
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 5Gi
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: spc-postgres
+  namespace: spc
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: spc-postgres
+  template:
+    metadata:
+      labels:
+        app: spc-postgres
+    spec:
+      containers:
+        - name: postgres
+          image: postgres:16.14-trixie
+          imagePullPolicy: IfNotPresent
+          ports:
+            - containerPort: 5432
+          env:
+            - name: POSTGRES_USER
+              valueFrom:
+                secretKeyRef:
+                  name: spc-postgres-secret
+                  key: POSTGRES_USER
+            - name: POSTGRES_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: spc-postgres-secret
+                  key: POSTGRES_PASSWORD
+            - name: POSTGRES_DB
+              valueFrom:
+                secretKeyRef:
+                  name: spc-postgres-secret
+                  key: POSTGRES_DB
+          volumeMounts:
+            - name: pgdata
+              mountPath: /var/lib/postgresql/data
+      volumes:
+        - name: pgdata
+          persistentVolumeClaim:
+            claimName: spc-postgres-pvc
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: spc-postgres
+  namespace: spc
+spec:
+  selector:
+    app: spc-postgres
+  ports:
+    - name: postgres
+      port: 5432
+      targetPort: 5432
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: spc-core
+  namespace: spc
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: spc-core
+  template:
+    metadata:
+      labels:
+        app: spc-core
+    spec:
+      containers:
+        - name: gateway
+          image: spc-gateway:latest
+          imagePullPolicy: IfNotPresent
+          ports:
+            - containerPort: 5070
+            - containerPort: 3001
+          env:
+            - name: TCP_PORT
+              value: "5070"
+            - name: HTTP_PORT
+              value: "3001"
+            - name: CSV_ENABLED
+              value: "false"
+            - name: PG_ENABLED
+              value: "true"
+            - name: PGHOST
+              value: spc-postgres
+            - name: PGPORT
+              value: "5432"
+            - name: PGUSER
+              valueFrom:
+                secretKeyRef:
+                  name: spc-postgres-secret
+                  key: POSTGRES_USER
+            - name: PGPASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: spc-postgres-secret
+                  key: POSTGRES_PASSWORD
+            - name: PGDATABASE
+              valueFrom:
+                secretKeyRef:
+                  name: spc-postgres-secret
+                  key: POSTGRES_DB
+          readinessProbe:
+            httpGet:
+              path: /api/devices
+              port: 3001
+            initialDelaySeconds: 5
+            periodSeconds: 10
+        - name: api
+          image: spc-api:latest
+          imagePullPolicy: IfNotPresent
+          ports:
+            - containerPort: 3000
+          env:
+            - name: PORT
+              value: "3000"
+            - name: DEVICE_HOST
+              value: spc-device
+            - name: DEVICE_PORT
+              value: "3002"
+            - name: GATEWAY_HOST
+              value: 127.0.0.1
+            - name: GATEWAY_PORT
+              value: "3001"
+            - name: PGHOST
+              value: spc-postgres
+            - name: PGPORT
+              value: "5432"
+            - name: PGUSER
+              valueFrom:
+                secretKeyRef:
+                  name: spc-postgres-secret
+                  key: POSTGRES_USER
+            - name: PGPASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: spc-postgres-secret
+                  key: POSTGRES_PASSWORD
+            - name: PGDATABASE
+              valueFrom:
+                secretKeyRef:
+                  name: spc-postgres-secret
+                  key: POSTGRES_DB
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 3000
+            initialDelaySeconds: 5
+            periodSeconds: 10
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: spc-gateway
+  namespace: spc
+spec:
+  selector:
+    app: spc-core
+  ports:
+    - name: gateway-tcp
+      port: 5070
+      targetPort: 5070
+    - name: gateway-http
+      port: 3001
+      targetPort: 3001
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: spc-api
+  namespace: spc
+spec:
+  selector:
+    app: spc-core
+  ports:
+    - name: api
+      port: 3000
+      targetPort: 3000
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: spc-device
+  namespace: spc
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: spc-device
+  template:
+    metadata:
+      labels:
+        app: spc-device
+    spec:
+      containers:
+        - name: device
+          image: spc-device:latest
+          imagePullPolicy: IfNotPresent
+          ports:
+            - containerPort: 3002
+            - containerPort: 5173
+          env:
+            - name: SERVER_PORT
+              value: "3002"
+            - name: GATEWAY_HOST
+              value: spc-gateway
+            - name: GATEWAY_PORT
+              value: "5070"
+            - name: GATEWAY_HTTP
+              value: http://spc-gateway:3001
+          readinessProbe:
+            httpGet:
+              path: /api/devices
+              port: 3002
+            initialDelaySeconds: 5
+            periodSeconds: 10
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: spc-device
+  namespace: spc
+spec:
+  selector:
+    app: spc-device
+  ports:
+    - name: device-api
+      port: 3002
+      targetPort: 3002
+    - name: device-ui
+      port: 5173
+      targetPort: 5173
