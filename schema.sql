@@ -90,45 +90,76 @@ ALTER TABLE device ADD COLUMN IF NOT EXISTS updated_at            TIMESTAMPTZ DE
 CREATE INDEX IF NOT EXISTS idx_device_site_type ON device (site_key, type);
 CREATE INDEX IF NOT EXISTS idx_device_status_last ON device (status_use, last_status_datetime DESC);
 
--- ── 시계열 ────────────────────────────────────────────────────────────────────
--- device_data 는 기존에 존재할 수 있으므로 누락 컬럼만 ALTER 로 추가한다.
+-- ── 시계열 (device_data) — v8 데이터구조 정렬 ─────────────────────────────────
+-- v8 통합 device_data: end_pressure / governor 공용. IECP 700/관말압력 페이로드를
+-- v8 컬럼(pressure/calc_pressure/...)으로 매핑해 저장한다.
+-- NOTE: v8 원안의 device_id 는 device_*.id(BIGINT FK)이지만, 장비 마스터 분리
+--       (device_end_pressure/device_governor)는 3단계 범위이므로 현재는 IECP
+--       deviceId(8자리 문자열)를 키로 유지한다. 마스터 분리 시 FK 로 전환.
 CREATE TABLE IF NOT EXISTS device_data (
   id                   BIGSERIAL PRIMARY KEY,
-  device_id            TEXT NOT NULL,
-  status_datetime      TEXT,
+  device_id            VARCHAR(8) NOT NULL,        -- IECP deviceId (v8: device_*.id 예정)
+  device_type          VARCHAR(20),               -- end_pressure / governor
+  status_datetime      TEXT,                       -- IECP statusDatetime (KST 14자리 원본)
   received_at          TIMESTAMPTZ NOT NULL,
-  pt_cur               DOUBLE PRECISION,
-  pt_b                 DOUBLE PRECISION,
-  p_con                DOUBLE PRECISION,
-  pe_cur               DOUBLE PRECISION,
-  operation_status     TEXT,
-  operation            TEXT,
-  remain_time_minutes  INTEGER,
-  remain_time_seconds  INTEGER,
-  status_code          INTEGER,
-  data_cycle           INTEGER,
-  network_cycle        INTEGER
+  pressure             DOUBLE PRECISION,           -- PTcur (kPa)
+  temperature          DOUBLE PRECISION,           -- ℃ (관말압력)
+  battery_voltage      DOUBLE PRECISION,           -- V  (관말압력)
+  rssi                 INTEGER,                    -- dBm
+  operation_status     VARCHAR(2),                 -- 0정지/1설정/2자동/3AI
+  operation_mode       VARCHAR(10),                -- L0~L5
+  calc_pressure        DOUBLE PRECISION,           -- PEcur (kPa)
+  prev_pressure        DOUBLE PRECISION,           -- PTb   (kPa)
+  init_pressure        DOUBLE PRECISION,           -- Pcon_init (kPa)
+  set_pressure         DOUBLE PRECISION,           -- Pcon  (kPa)
+  control_action       VARCHAR(2),                 -- moterAction (1없음/2승압/3감압)
+  remain_minutes       INTEGER,
+  remain_seconds       INTEGER,
+  motor_position       DOUBLE PRECISION,
+  status_code          INTEGER,                    -- IECP statusCode
+  status               VARCHAR(10),                -- normal/warning/alarm/offline
+  raw_payload          TEXT,                       -- IECP data 원본(JSON)
+  created_at           TIMESTAMPTZ NOT NULL DEFAULT now()
 );
-ALTER TABLE device_data ADD COLUMN IF NOT EXISTS pt_b_datetime    TEXT;
-ALTER TABLE device_data ADD COLUMN IF NOT EXISTS p_con_datetime   TEXT;
-ALTER TABLE device_data ADD COLUMN IF NOT EXISTS p_con_init       DOUBLE PRECISION;
-ALTER TABLE device_data ADD COLUMN IF NOT EXISTS data_cycle_unit  TEXT;
-ALTER TABLE device_data ADD COLUMN IF NOT EXISTS network_cycle_unit TEXT;
-ALTER TABLE device_data ADD COLUMN IF NOT EXISTS moter_up         INTEGER;
-ALTER TABLE device_data ADD COLUMN IF NOT EXISTS moter_down       INTEGER;
-ALTER TABLE device_data ADD COLUMN IF NOT EXISTS moter_action     VARCHAR(1);
-ALTER TABLE device_data ADD COLUMN IF NOT EXISTS operation_mode   VARCHAR(10);
+-- v8 컬럼 보강(기존 PoC device_data 테이블이 있을 때 안전하게 추가)
+ALTER TABLE device_data ADD COLUMN IF NOT EXISTS device_type     VARCHAR(20);
+ALTER TABLE device_data ADD COLUMN IF NOT EXISTS pressure        DOUBLE PRECISION;
+ALTER TABLE device_data ADD COLUMN IF NOT EXISTS temperature     DOUBLE PRECISION;
+ALTER TABLE device_data ADD COLUMN IF NOT EXISTS battery_voltage DOUBLE PRECISION;
+ALTER TABLE device_data ADD COLUMN IF NOT EXISTS rssi            INTEGER;
+ALTER TABLE device_data ADD COLUMN IF NOT EXISTS operation_status VARCHAR(2);
+ALTER TABLE device_data ADD COLUMN IF NOT EXISTS operation_mode  VARCHAR(10);
+ALTER TABLE device_data ADD COLUMN IF NOT EXISTS calc_pressure   DOUBLE PRECISION;
+ALTER TABLE device_data ADD COLUMN IF NOT EXISTS prev_pressure   DOUBLE PRECISION;
+ALTER TABLE device_data ADD COLUMN IF NOT EXISTS init_pressure   DOUBLE PRECISION;
+ALTER TABLE device_data ADD COLUMN IF NOT EXISTS set_pressure    DOUBLE PRECISION;
+ALTER TABLE device_data ADD COLUMN IF NOT EXISTS control_action  VARCHAR(2);
+ALTER TABLE device_data ADD COLUMN IF NOT EXISTS remain_minutes  INTEGER;
+ALTER TABLE device_data ADD COLUMN IF NOT EXISTS remain_seconds  INTEGER;
+ALTER TABLE device_data ADD COLUMN IF NOT EXISTS motor_position  DOUBLE PRECISION;
+ALTER TABLE device_data ADD COLUMN IF NOT EXISTS status_code     INTEGER;
+ALTER TABLE device_data ADD COLUMN IF NOT EXISTS status          VARCHAR(10);
+ALTER TABLE device_data ADD COLUMN IF NOT EXISTS raw_payload     TEXT;
+ALTER TABLE device_data ADD COLUMN IF NOT EXISTS status_datetime TEXT;
+ALTER TABLE device_data ADD COLUMN IF NOT EXISTS created_at      TIMESTAMPTZ DEFAULT now();
 CREATE INDEX IF NOT EXISTS idx_device_data_device_received ON device_data (device_id, received_at DESC);
-CREATE INDEX IF NOT EXISTS idx_device_data_device_sdt ON device_data (device_id, status_datetime DESC);
 
+-- ── 알람 (device_alarm) — 701 은 API 경유 INSERT ──────────────────────────────
 CREATE TABLE IF NOT EXISTS device_alarm (
   id              BIGSERIAL PRIMARY KEY,
-  device_id       TEXT NOT NULL,
-  alarm_datetime  TEXT,
-  alarm_type      INTEGER,
-  alarm_code      INTEGER,
-  received_at     TIMESTAMPTZ NOT NULL
+  device_id       VARCHAR(8) NOT NULL,            -- IECP deviceId
+  branch_id       BIGINT,
+  alarm_datetime  TIMESTAMPTZ,                    -- Gateway 가 KST→ISO 변환 후 저장
+  alarm_type      INTEGER,                        -- alarmSetting 인덱스 0~5
+  alarm_code      INTEGER,                        -- 화면 표시용 코드
+  message         VARCHAR(255),
+  severity        VARCHAR(20),                    -- info/warning/critical
+  acknowledged    BOOLEAN NOT NULL DEFAULT false,
+  acknowledged_by BIGINT,
+  acknowledged_at TIMESTAMPTZ,
+  received_at     TIMESTAMPTZ NOT NULL DEFAULT now()
 );
+ALTER TABLE device_alarm ADD COLUMN IF NOT EXISTS branch_id       BIGINT;
 ALTER TABLE device_alarm ADD COLUMN IF NOT EXISTS message         VARCHAR(255);
 ALTER TABLE device_alarm ADD COLUMN IF NOT EXISTS severity        VARCHAR(20);
 ALTER TABLE device_alarm ADD COLUMN IF NOT EXISTS acknowledged    BOOLEAN NOT NULL DEFAULT false;
@@ -173,37 +204,75 @@ CREATE TABLE IF NOT EXISTS device_setting (
   updated_by         BIGINT
 );
 
--- 연간 설정 압력 (Long format: device_id + MMDD)
-CREATE TABLE IF NOT EXISTS device_setting_pupl (
-  device_id   VARCHAR(8) NOT NULL,
-  year        SMALLINT   NOT NULL,
-  month_day   VARCHAR(4) NOT NULL,   -- MMDD
-  pupl        DOUBLE PRECISION,
+-- ── 연간 설정 압력 (annual_pressure) — v8 정렬 ────────────────────────────────
+-- 503 업로드 응답(365개 Pupl) / 502 다운로드 원본을 day_index(1~365)로 저장.
+CREATE TABLE IF NOT EXISTS annual_pressure (
+  id          BIGSERIAL PRIMARY KEY,
+  device_id   VARCHAR(8) NOT NULL,            -- IECP deviceId
+  year        INTEGER    NOT NULL,            -- 적용 연도
+  day_index   INTEGER    NOT NULL,            -- 1~365 (Pupl_001~365)
+  pressure    DOUBLE PRECISION,               -- kPa
   updated_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
-  PRIMARY KEY (device_id, year, month_day)
+  UNIQUE (device_id, year, day_index)
+);
+CREATE INDEX IF NOT EXISTS idx_annual_pressure_device_year ON annual_pressure (device_id, year);
+
+-- ── 장비 접속 상태 (device_connection) — v8 정렬 ──────────────────────────────
+-- Gateway 가 dial-in/해제 시 POST /gateway/device-status 로 보고 → 여기에 upsert.
+CREATE TABLE IF NOT EXISTS device_connection (
+  id                    BIGSERIAL PRIMARY KEY,
+  device_id             VARCHAR(8) UNIQUE NOT NULL,  -- IECP deviceId
+  status                VARCHAR(10) NOT NULL,        -- online / offline
+  last_connected_at     TIMESTAMPTZ,
+  last_disconnected_at  TIMESTAMPTZ,
+  gateway_id            VARCHAR(50),
+  ip                    VARCHAR(45),
+  updated_at            TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
--- ── 제어 큐 ───────────────────────────────────────────────────────────────────
--- 기존 device_command 는 단순 로그였으므로 누락 컬럼을 ALTER 로 보강한다.
+-- ── 제어 큐 (device_command) — v8 정렬 ────────────────────────────────────────
+-- 명령 라이프사이클: pending → sent(Gateway poll) → acked/failed(결과보고) / expired.
 CREATE TABLE IF NOT EXISTS device_command (
   id             BIGSERIAL PRIMARY KEY,
-  device_id      TEXT NOT NULL,
-  function_code  TEXT NOT NULL,
-  operation      TEXT NOT NULL,
-  sent_at        TIMESTAMPTZ,
-  status         TEXT NOT NULL
+  device_id      VARCHAR(8) NOT NULL,         -- IECP deviceId (8자리)
+  function_code  VARCHAR(3) NOT NULL,         -- 300/500/501/502/503/800
+  command_type   VARCHAR(30),                 -- operation/cycle/setting/annual_pressure/annual_request/calc_pressure
+  payload        JSONB,                       -- 페이지별 필드 데이터
+  status         VARCHAR(12) NOT NULL DEFAULT 'pending', -- pending/sent/acked/failed/expired/cancelled
+  transaction_id INTEGER,                     -- IECP transactionId (0~9999)
+  result_code    INTEGER,                     -- IECP code (200/400/...)
+  result_message VARCHAR(255),
+  priority       SMALLINT NOT NULL DEFAULT 5,
+  requested_by   BIGINT,                      -- users.id
+  gateway_id     VARCHAR(50),                 -- 가져간 게이트웨이
+  retry_count    SMALLINT NOT NULL DEFAULT 0,
+  expires_at     TIMESTAMPTZ,                 -- dial-in 주기 고려 만료
+  sent_at        TIMESTAMPTZ,                 -- Gateway 가 poll 로 가져간 시각
+  completed_at   TIMESTAMPTZ,                 -- 장비 응답 시각
+  created_at     TIMESTAMPTZ NOT NULL DEFAULT now()
 );
-ALTER TABLE device_command ADD COLUMN IF NOT EXISTS page_id        VARCHAR(2);
-ALTER TABLE device_command ADD COLUMN IF NOT EXISTS data_json      JSONB;
-ALTER TABLE device_command ADD COLUMN IF NOT EXISTS priority       SMALLINT NOT NULL DEFAULT 5;
-ALTER TABLE device_command ADD COLUMN IF NOT EXISTS requested_by   BIGINT;
-ALTER TABLE device_command ADD COLUMN IF NOT EXISTS requested_at   TIMESTAMPTZ NOT NULL DEFAULT now();
-ALTER TABLE device_command ADD COLUMN IF NOT EXISTS acked_at       TIMESTAMPTZ;
+-- 기존 PoC device_command(operation NOT NULL 로그형) 보강 (재실행 안전)
+ALTER TABLE device_command ADD COLUMN IF NOT EXISTS command_type   VARCHAR(30);
+ALTER TABLE device_command ADD COLUMN IF NOT EXISTS payload        JSONB;
+ALTER TABLE device_command ADD COLUMN IF NOT EXISTS transaction_id INTEGER;
 ALTER TABLE device_command ADD COLUMN IF NOT EXISTS result_code    INTEGER;
 ALTER TABLE device_command ADD COLUMN IF NOT EXISTS result_message VARCHAR(255);
+ALTER TABLE device_command ADD COLUMN IF NOT EXISTS priority       SMALLINT NOT NULL DEFAULT 5;
+ALTER TABLE device_command ADD COLUMN IF NOT EXISTS requested_by   BIGINT;
+ALTER TABLE device_command ADD COLUMN IF NOT EXISTS gateway_id     VARCHAR(50);
 ALTER TABLE device_command ADD COLUMN IF NOT EXISTS retry_count    SMALLINT NOT NULL DEFAULT 0;
 ALTER TABLE device_command ADD COLUMN IF NOT EXISTS expires_at     TIMESTAMPTZ;
-CREATE INDEX IF NOT EXISTS idx_device_command_pickup ON device_command (device_id, status, priority DESC, requested_at);
+ALTER TABLE device_command ADD COLUMN IF NOT EXISTS completed_at   TIMESTAMPTZ;
+ALTER TABLE device_command ADD COLUMN IF NOT EXISTS created_at     TIMESTAMPTZ NOT NULL DEFAULT now();
+-- 기존 operation 컬럼은 v8 에서 payload 로 흡수 → NOT NULL 해제(설정/연간 명령 허용).
+-- (fresh DB 에는 operation 컬럼이 없으므로 존재할 때만 처리)
+DO $$ BEGIN
+  IF EXISTS (SELECT 1 FROM information_schema.columns
+             WHERE table_name = 'device_command' AND column_name = 'operation') THEN
+    ALTER TABLE device_command ALTER COLUMN operation DROP NOT NULL;
+  END IF;
+END $$;
+CREATE INDEX IF NOT EXISTS idx_device_command_pickup ON device_command (status, device_id, priority DESC, created_at);
 
 -- ── 로그 / 룩업 ───────────────────────────────────────────────────────────────
 CREATE TABLE IF NOT EXISTS frame_log (
@@ -245,7 +314,7 @@ ON CONFLICT (site_key) DO NOTHING;
 
 -- 기본 관리자: admin@spc.local / demo1234 (bcrypt). gateway 부팅 시 보장.
 INSERT INTO alarm_code (code, name, severity, description) VALUES
-  (1, '통신 누락',      'warn',     '장비와의 통신이 일정 시간 이상 누락'),
+  (1, '통신 누락',      'warning',  '장비와의 통신이 일정 시간 이상 누락'),
   (2, '최고 압력 초과', 'critical', '설정 최고 압력 초과'),
   (3, '최저 압력 미달', 'critical', '설정 최저 압력 미달'),
   (4, '전원 공급 이상', 'critical', '전원 공급 알람'),

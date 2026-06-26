@@ -4,12 +4,25 @@ const fs = require('fs');
 const path = require('path');
 const { Pool } = require('pg');
 
+const api = require('./apiClient');
+const { kstToIso } = require('./kst');
+const {
+  parseFrame, buildControlFrame, buildJsonCommandFrame,
+  buildAnnualDownloadFrame, buildAnnualRequestFrame, decodeAnnualPressures, buildAck,
+} = require('./frames');
+
 const TCP_PORT = parseInt(process.env.TCP_PORT || '5070', 10);
 const HTTP_PORT = parseInt(process.env.HTTP_PORT || '3001', 10);
 const DB_PATH = path.join(__dirname, 'db.json');
 const CSV_DIR = path.join(__dirname, 'csv');
 const CSV_ENABLED = process.env.CSV_ENABLED === 'true';
 
+// 명령 큐 polling 주기 / 결과 응답 대기 한계
+const POLL_INTERVAL_MS = parseInt(process.env.POLL_INTERVAL_MS || '5000', 10);
+const POLL_LIMIT = parseInt(process.env.POLL_LIMIT || '10', 10);
+const RESULT_TIMEOUT_MS = parseInt(process.env.RESULT_TIMEOUT_MS || '30000', 10);
+
+// 700 정주기 데이터는 설계상 Gateway 가 DB 에 직접 INSERT (API 미경유)
 const PG_ENABLED = process.env.PG_ENABLED !== 'false';
 const pgPool = PG_ENABLED
   ? new Pool({
@@ -22,86 +35,43 @@ const pgPool = PG_ENABLED
   : null;
 let pgReady = false;
 
-// CSV는 기본 비활성화, 필요 시에만 활성화
-if (CSV_ENABLED && !fs.existsSync(CSV_DIR))
-  fs.mkdirSync(CSV_DIR, { recursive: true });
+if (CSV_ENABLED && !fs.existsSync(CSV_DIR)) fs.mkdirSync(CSV_DIR, { recursive: true });
 
-function logInfo(message) {
-  console.log(`[GW] ${message}`);
-}
-
-function logFrame(
-  direction,
-  deviceId,
-  functionCode,
-  pageId,
-  message,
-  extra = '',
-) {
+function logInfo(message) { console.log(`[GW] ${message}`); }
+function logFrame(direction, deviceId, functionCode, pageId, message, extra = '') {
   const prefix = `[${direction}] ${deviceId || '-'} FC=${functionCode || '-'} PG=${pageId || '-'} ${message}`;
   console.log(extra ? `${prefix} ${extra}` : prefix);
 }
-
 function logRaw(label, buf) {
-  const hex =
-    buf
-      .toString('hex')
-      .match(/.{1,2}/g)
-      ?.join(' ') || '';
+  const hex = buf.toString('hex').match(/.{1,2}/g)?.join(' ') || '';
   console.log(`[GW] ${label} raw=${buf.toString('utf8')} hex=${hex}`);
 }
 
-// ── DB ──────────────────────────────────────────────────────────────────────
+// ── 로컬 db.json (HTTP 조회용 캐시) ───────────────────────────────────────────
 function loadDb() {
-  try {
-    return JSON.parse(fs.readFileSync(DB_PATH, 'utf8'));
-  } catch {
-    return { devices: {}, history: [], alarms: [], commands: [] };
-  }
+  try { return JSON.parse(fs.readFileSync(DB_PATH, 'utf8')); }
+  catch { return { devices: {}, history: [], alarms: [], commands: [] }; }
 }
-function saveDb(db) {
-  fs.writeFileSync(DB_PATH, JSON.stringify(db, null, 2));
-}
+function saveDb(db) { fs.writeFileSync(DB_PATH, JSON.stringify(db, null, 2)); }
 
-// ── CSV 저장 함수 ───────────────────────────────────────────────────────────
+// ── CSV (옵션) ────────────────────────────────────────────────────────────────
 function escapeCsv(val) {
   if (val === null || val === undefined) return '';
   const str = String(val);
-  if (str.includes(',') || str.includes('"') || str.includes('\n')) {
-    return '"' + str.replace(/"/g, '""') + '"';
-  }
-  return str;
+  return /[",\n]/.test(str) ? '"' + str.replace(/"/g, '""') + '"' : str;
 }
-
 function appendToCsv(filename, headers, data) {
   if (!CSV_ENABLED) return;
-
   const filepath = path.join(CSV_DIR, filename);
-  const fileExists = fs.existsSync(filepath);
-
-  if (!fileExists) {
-    const headerRow = headers.map(escapeCsv).join(',') + '\n';
-    fs.writeFileSync(filepath, headerRow);
-  }
-
-  const dataRow = headers.map((h) => escapeCsv(data[h])).join(',') + '\n';
-  fs.appendFileSync(filepath, dataRow);
+  if (!fs.existsSync(filepath)) fs.writeFileSync(filepath, headers.map(escapeCsv).join(',') + '\n');
+  fs.appendFileSync(filepath, headers.map((h) => escapeCsv(data[h])).join(',') + '\n');
 }
 
 async function initPostgres() {
-  if (!pgPool) {
-    logInfo('PostgreSQL 저장 비활성화 (PG_ENABLED=false)');
-    return;
-  }
-
+  if (!pgPool) { logInfo('PostgreSQL 저장 비활성화 (PG_ENABLED=false)'); return; }
   try {
-    // 전체 스키마는 schema.sql 한 파일에서 관리 (재실행 안전).
-    const schemaSql = fs.readFileSync(
-      path.join(__dirname, 'schema.sql'),
-      'utf8',
-    );
+    const schemaSql = fs.readFileSync(path.join(__dirname, 'schema.sql'), 'utf8');
     await pgPool.query(schemaSql);
-
     pgReady = true;
     logInfo('PostgreSQL 스키마 적용 완료 (schema.sql)');
   } catch (err) {
@@ -110,110 +80,27 @@ async function initPostgres() {
   }
 }
 
-// Page 700 수신 시 device 마스터 upsert (deviceId = siteKey(2)+type(1)+deviceKey(4))
-async function upsertDevice(deviceId, payload, receivedAt) {
-  if (!pgReady || !pgPool) return;
-  const siteKey = deviceId.slice(0, 2);
-  const type = deviceId.slice(2, 3);
-  const deviceKey = deviceId.slice(3, 7);
-  try {
-    logFrame(
-      'PG',
-      deviceId,
-      '700',
-      '00',
-      'device upsert 시작',
-      `siteKey=${siteKey} type=${type} key=${deviceKey}`,
-    );
-    await pgPool.query(
-      `INSERT INTO device (
-         device_id, site_key, type, device_key, connected,
-         last_status_datetime, last_pt_cur, last_p_con, last_pe_cur,
-         last_operation_status, last_operation, last_status_code, updated_at
-       ) VALUES ($1,$2,$3,$4,true,$5,$6,$7,$8,$9,$10,$11, now())
-       ON CONFLICT (device_id) DO UPDATE SET
-         connected = true,
-         last_status_datetime = EXCLUDED.last_status_datetime,
-         last_pt_cur = EXCLUDED.last_pt_cur,
-         last_p_con = EXCLUDED.last_p_con,
-         last_pe_cur = EXCLUDED.last_pe_cur,
-         last_operation_status = EXCLUDED.last_operation_status,
-         last_operation = EXCLUDED.last_operation,
-         last_status_code = EXCLUDED.last_status_code,
-         updated_at = now()`,
-      [
-        deviceId,
-        siteKey,
-        type,
-        deviceKey,
-        receivedAt,
-        payload.PTcur,
-        payload.Pcon,
-        payload.PEcur,
-        payload.operationStatus,
-        payload.operation,
-        payload.statusCode,
-      ],
-    );
-  } catch (err) {
-    console.error('[PG] device upsert 실패:', err.message);
-  }
-}
-
-async function setDeviceDisconnected(deviceId) {
-  if (!pgReady || !pgPool) return;
-  try {
-    await pgPool.query(
-      'UPDATE device SET connected = false, updated_at = now() WHERE device_id = $1',
-      [deviceId],
-    );
-    logFrame('PG', deviceId, '-', '-', 'device disconnected');
-  } catch (err) {
-    console.error('[PG] device disconnect 갱신 실패:', err.message);
-  }
-}
-
-async function saveDataToPostgres(row) {
+// ── 700 정주기 데이터 → device_data 직접 INSERT (v8 컬럼 매핑) ─────────────────
+async function saveDeviceDataToPostgres(row) {
   if (!pgReady || !pgPool) return;
   try {
     await pgPool.query(
       `INSERT INTO device_data (
-        device_id, status_datetime, received_at, pt_cur, pt_b, pt_b_datetime,
-        p_con, p_con_datetime, p_con_init, pe_cur,
-        operation_status, operation, remain_time_minutes, remain_time_seconds,
-        status_code, data_cycle, data_cycle_unit, network_cycle, network_cycle_unit,
-        moter_up, moter_down, moter_action, operation_mode
-      ) VALUES (
-        $1, $2, $3, $4, $5, $6,
-        $7, $8, $9, $10,
-        $11, $12, $13, $14,
-        $15, $16, $17, $18, $19,
-        $20, $21, $22, $23
-      )`,
+         device_id, device_type, status_datetime, received_at,
+         pressure, temperature, battery_voltage, rssi,
+         operation_status, operation_mode, calc_pressure, prev_pressure,
+         init_pressure, set_pressure, control_action,
+         remain_minutes, remain_seconds, motor_position, status_code, status, raw_payload
+       ) VALUES (
+         $1,$2,$3,$4, $5,$6,$7,$8, $9,$10,$11,$12, $13,$14,$15, $16,$17,$18,$19,$20,$21
+       )`,
       [
-        row.device_id,
-        row.status_datetime,
-        row.received_at,
-        row.pt_cur,
-        row.pt_b,
-        row.pt_b_datetime,
-        row.p_con,
-        row.p_con_datetime,
-        row.p_con_init,
-        row.pe_cur,
-        row.operation_status,
-        row.operation,
-        row.remain_time_minutes,
-        row.remain_time_seconds,
-        row.status_code,
-        row.data_cycle,
-        row.data_cycle_unit,
-        row.network_cycle,
-        row.network_cycle_unit,
-        row.moter_up,
-        row.moter_down,
-        row.moter_action,
-        row.operation_mode,
+        row.device_id, row.device_type, row.status_datetime, row.received_at,
+        row.pressure, row.temperature, row.battery_voltage, row.rssi,
+        row.operation_status, row.operation_mode, row.calc_pressure, row.prev_pressure,
+        row.init_pressure, row.set_pressure, row.control_action,
+        row.remain_minutes, row.remain_seconds, row.motor_position,
+        row.status_code, row.status, row.raw_payload,
       ],
     );
   } catch (err) {
@@ -221,379 +108,253 @@ async function saveDataToPostgres(row) {
   }
 }
 
-async function saveAlarmToPostgres(row) {
-  if (!pgReady || !pgPool) return;
-  try {
-    await pgPool.query(
-      `INSERT INTO device_alarm (device_id, alarm_datetime, alarm_type, alarm_code, received_at)
-       VALUES ($1, $2, $3, $4, $5)`,
-      [
-        row.device_id,
-        row.alarm_datetime,
-        row.alarm_type,
-        row.alarm_code,
-        row.received_at,
-      ],
-    );
-  } catch (err) {
-    console.error('[PG] device_alarm 저장 실패:', err.message);
-  }
-}
-
-async function saveCommandToPostgres(row) {
-  if (!pgReady || !pgPool) return;
-  try {
-    await pgPool.query(
-      `INSERT INTO device_command (device_id, function_code, operation, sent_at, status)
-       VALUES ($1, $2, $3, $4, $5)`,
-      [
-        row.device_id,
-        row.function_code,
-        row.operation,
-        row.sent_at,
-        row.status,
-      ],
-    );
-  } catch (err) {
-    console.error('[PG] device_command 저장 실패:', err.message);
-  }
-}
-
-// ── IECP 체크섬 ──────────────────────────────────────────────────────────────
-function calcChecksum(buf, start, end) {
-  let sum = 0;
-  for (let i = start; i < end; i++) sum += buf[i];
-  return ('0000' + (sum % 10000)).slice(-4);
-}
-
-// ── 프레임 파싱 ──────────────────────────────────────────────────────────────
-function parseFrame(buf) {
-  if (buf[0] !== 0x40) throw new Error('Bad STX');
-  if (buf[buf.length - 1] !== 0x21) throw new Error('Bad ETX');
-
-  const requestType = buf.slice(8, 9).toString();
-  const serviceId = buf.slice(10, 14).toString();
-  const deviceId = buf.slice(14, 22).toString().trimEnd();
-  const functionCode = buf.slice(22, 25).toString();
-  const pageId = buf.slice(25, 27).toString();
-  const addressType = buf.slice(27, 28).toString();
-  const dataLength = parseInt(buf.slice(31, 34).toString(), 10);
-
-  const data = buf.slice(34, 34 + dataLength);
-  const checksumPos = 34 + dataLength;
-  const checksum = buf.slice(checksumPos, checksumPos + 4).toString();
-  const expected = calcChecksum(buf, 10, checksumPos);
-
+// IECP 700 페이로드 → v8 device_data row 매핑
+function mapPage700ToDeviceData(deviceId, payload, receivedAtIso) {
   return {
-    requestType,
-    serviceId,
-    deviceId,
-    functionCode,
-    pageId,
-    addressType,
-    dataLength,
-    data,
-    checksumOk: checksum === expected,
-    rawBuf: buf,
+    device_id: deviceId,
+    device_type: 'governor',                         // 700 전체 페이지 = 정압기
+    status_datetime: payload.statusDatetime || null,  // KST 14자리 원본 보존
+    received_at: receivedAtIso,
+    pressure: payload.PTcur,
+    temperature: payload.temperature ?? null,
+    battery_voltage: payload.batteryVoltage ?? null,
+    rssi: payload.rssi ?? null,
+    operation_status: payload.operationStatus,
+    operation_mode: payload.operationMode ?? null,
+    calc_pressure: payload.PEcur,
+    prev_pressure: payload.PTb ?? null,
+    init_pressure: payload.Pcon_init ?? null,
+    set_pressure: payload.Pcon,
+    control_action: payload.moterAction ?? null,
+    remain_minutes: payload.remainTimeMinutes ?? null,
+    remain_seconds: payload.remainTimeSeconds ?? null,
+    motor_position: payload.motorPosition ?? null,
+    status_code: payload.statusCode ?? null,
+    status: payload.status || 'normal',
+    raw_payload: JSON.stringify(payload),
   };
 }
 
-// ── IECP 프레임 빌드 (Page 300 제어 명령) ──────────────────────────────────────
-let txCounter = 0;
-function buildControlFrame({ deviceId, operation }) {
-  const requestType = '1'; // Request for response
-  const data = Buffer.from('00' + operation, 'utf8'); // requestType(2) + operation(1)
-  const dataLength = data.length;
-  const txId = (++txCounter % 10000).toString().padStart(4, '0');
+// ── 명령 큐 상태 ──────────────────────────────────────────────────────────────
+const sessions = new Map();          // deviceId → socket
+const pendingByDevice = new Map();   // deviceId → [command] (장비 미접속 시 대기)
+const awaitingByTx = new Map();      // transactionId(str) → { commandId, deviceId, functionCode, timer }
+const annual503 = new Map();         // deviceId → { commandId, year, frags: Map<seq,Buffer>, size }
 
-  const buf = Buffer.alloc(39 + dataLength);
-  let pos = 0;
-
-  buf.write('@', pos++);
-  buf.write('T', pos++);
-  buf.write(txId, pos);
-  pos += 4;
-  buf.write('1', pos++); // transactionSize
-  buf.write('1', pos++); // transactionSeq
-  buf.write(requestType, pos++);
-  buf.write('D', pos++); // destination=Device
-  buf.write('0000', pos);
-  pos += 4; // serviceId
-  buf.write(deviceId.slice(0, 7).padEnd(7, ' ') + ' ', pos);
-  pos += 8; // deviceId
-  buf.write('300', pos);
-  pos += 3; // functionCode=300 (제어)
-  buf.write('00', pos);
-  pos += 2; // pageId=00
-  buf.write('J', pos++); // addressType=J
-  buf.write('000', pos);
-  pos += 3; // address
-  buf.write(dataLength.toString().padStart(3, '0'), pos);
-  pos += 3;
-
-  data.copy(buf, pos);
-  pos += dataLength;
-
-  buf.write(calcChecksum(buf, 10, pos), pos);
-  pos += 4;
-  buf.write('!', pos);
-
-  logFrame(
-    'TX',
-    deviceId,
-    '300',
-    '00',
-    'control frame 생성',
-    `operation=${operation}`,
-  );
-
-  return buf;
+function queueForDevice(deviceId, cmd) {
+  if (!pendingByDevice.has(deviceId)) pendingByDevice.set(deviceId, []);
+  pendingByDevice.get(deviceId).push(cmd);
 }
 
-// ── ACK 응답 빌드 ─────────────────────────────────────────────────────────────
-function buildAck(rawBuf, code = 200, message = 'ok') {
-  const protocolId = rawBuf.slice(1, 2).toString();
-  const transactionId = rawBuf.slice(2, 6).toString();
-  const serviceId = rawBuf.slice(10, 14).toString();
-  const deviceId = rawBuf.slice(14, 22).toString();
-  const functionCode = rawBuf.slice(22, 25).toString();
-  const pageId = rawBuf.slice(25, 27).toString();
-  const addressType = rawBuf.slice(27, 28).toString();
-  const address = rawBuf.slice(28, 31).toString();
+function buildCommandFrame(cmd) {
+  const common = { deviceId: cmd.deviceId, transactionId: cmd.transactionId, payload: cmd.payload };
+  switch (cmd.functionCode) {
+    case '300': return buildControlFrame(common);
+    case '501':
+    case '800': return buildJsonCommandFrame({ ...common, functionCode: cmd.functionCode });
+    case '502': return buildAnnualDownloadFrame({ deviceId: cmd.deviceId, transactionId: cmd.transactionId, pressures: (cmd.payload && cmd.payload.pressures) || [] });
+    case '503': return buildAnnualRequestFrame(common);
+    default:    return buildJsonCommandFrame({ ...common, functionCode: cmd.functionCode });
+  }
+}
 
-  const msg = Buffer.from(message.slice(0, 20).padEnd(20, ' '));
-  const msgLen = msg.length;
-  // dataLen in response = code(3) + msgLenField(3) + msg
-  const totalDataLen = 3 + 3 + msgLen;
+// 명령을 장비 소켓으로 전송하고 결과 추적을 등록한다.
+function sendCommand(cmd, socket) {
+  const did = cmd.deviceId;
+  try {
+    const frame = buildCommandFrame(cmd);
+    socket.write(frame);
+    logFrame('TX', did, cmd.functionCode, '00', '명령 전송', `cmdId=${cmd.commandId} tx=${cmd.transactionId}`);
+    logRaw('TX command frame', frame);
 
-  const buf = Buffer.alloc(34 + totalDataLen + 4 + 1);
-  let pos = 0;
+    if (cmd.functionCode === '503') {
+      // 503 은 장비가 1460B 응답을 보내면 그때 결과 보고. 응답 대기 상태만 등록.
+      annual503.set(did, { commandId: cmd.commandId, year: (cmd.payload && cmd.payload.year) || new Date().getFullYear(), frags: new Map(), size: 1 });
+      return;
+    }
 
-  buf.write('@', pos++);
-  buf.write(protocolId, pos++);
-  buf.write(transactionId, pos);
-  pos += 4;
-  buf.write('1', pos++);
-  buf.write('1', pos++);
-  buf.write('3', pos++); // requestType = Response
-  buf.write('D', pos++); // destination = Device
-  buf.write(serviceId, pos);
-  pos += 4;
-  buf.write(deviceId, pos);
-  pos += 8;
-  buf.write(functionCode, pos);
-  pos += 3;
-  buf.write(pageId, pos);
-  pos += 2;
-  buf.write(addressType, pos++);
-  buf.write(address, pos);
-  pos += 3;
-  buf.write(totalDataLen.toString().padStart(3, '0'), pos);
-  pos += 3;
+    // 그 외: 장비 응답(같은 tx) 수신 시 결과 보고. 미응답 시 전송완료로 fallback.
+    const txKey = String(cmd.transactionId);
+    const timer = setTimeout(() => {
+      if (awaitingByTx.has(txKey)) {
+        awaitingByTx.delete(txKey);
+        void api.reportResult(cmd.commandId, { status: 'acked', resultCode: 200, resultMessage: 'delivered (no device response)' })
+          .catch((e) => console.error('[API] result 보고 실패:', e.message));
+      }
+    }, RESULT_TIMEOUT_MS);
+    awaitingByTx.set(txKey, { commandId: cmd.commandId, deviceId: did, functionCode: cmd.functionCode, timer });
+  } catch (e) {
+    console.error('[GW] 명령 전송 실패:', e.message);
+    void api.reportResult(cmd.commandId, { status: 'failed', resultCode: 500, resultMessage: e.message })
+      .catch((err) => console.error('[API] result 보고 실패:', err.message));
+  }
+}
 
-  buf.write(code.toString().padStart(3, '0'), pos);
-  pos += 3;
-  buf.write(msgLen.toString().padStart(3, '0'), pos);
-  pos += 3;
-  msg.copy(buf, pos);
-  pos += msgLen;
+// 장비 접속 시 대기 명령 flush
+function flushPending(deviceId, socket) {
+  const list = pendingByDevice.get(deviceId);
+  if (!list || list.length === 0) return;
+  pendingByDevice.set(deviceId, []);
+  logFrame('GW', deviceId, '-', '-', '대기 명령 flush', `count=${list.length}`);
+  for (const cmd of list) sendCommand(cmd, socket);
+}
 
-  buf.write(calcChecksum(buf, 10, pos), pos);
-  pos += 4;
-  buf.write('!', pos);
+// ── 명령 polling 루프 ─────────────────────────────────────────────────────────
+let polling = false;
+async function pollOnce() {
+  if (polling) return;
+  polling = true;
+  try {
+    const commands = await api.pollCommands(POLL_LIMIT);
+    for (const cmd of commands) {
+      const did = String(cmd.deviceId || '').trim();
+      const socket = sessions.get(did);
+      const norm = { ...cmd, deviceId: did };
+      if (socket) sendCommand(norm, socket);
+      else { queueForDevice(did, norm); logFrame('GW', did, cmd.functionCode, '-', '명령 대기(장비 미접속)', `cmdId=${cmd.commandId}`); }
+    }
+  } catch (e) {
+    // API 미기동 등은 조용히 재시도 (소음 방지)
+    if (!/ECONNREFUSED/.test(e.message)) console.error('[API] poll 오류:', e.message);
+  } finally {
+    polling = false;
+  }
+}
 
-  logFrame(
-    'TX',
-    deviceId.trim(),
-    functionCode,
-    pageId,
-    'ACK 송신',
-    `code=${code} message=${message}`,
-  );
+// 장비 응답 프레임으로 명령 결과 해소
+function resolveCommandResult(frame) {
+  const txKey = frame.transactionId;
+  const awaiting = awaitingByTx.get(txKey);
+  if (!awaiting) return false;
+  clearTimeout(awaiting.timer);
+  awaitingByTx.delete(txKey);
+  let code = parseInt(frame.data.slice(0, 3).toString(), 10);
+  if (Number.isNaN(code)) code = 200;
+  const ok = code >= 200 && code < 300;
+  void api.reportResult(awaiting.commandId, {
+    status: ok ? 'acked' : 'failed', resultCode: code, resultMessage: ok ? 'ok' : 'device error',
+  }).catch((e) => console.error('[API] result 보고 실패:', e.message));
+  logFrame('GW', frame.deviceId, frame.functionCode, frame.pageId, '명령 결과 보고', `cmdId=${awaiting.commandId} code=${code}`);
+  return true;
+}
 
-  return buf;
+// 503 응답(분할 가능) 재조립 → 완료 시 API 로 연간압력 업로드
+async function handle503Response(frame) {
+  const did = frame.deviceId;
+  const ctx = annual503.get(did);
+  if (!ctx) { logFrame('RX', did, '503', frame.pageId, '503 응답 수신했으나 요청 컨텍스트 없음'); return; }
+  ctx.size = frame.transactionSize || 1;
+  ctx.frags.set(frame.transactionSeq || 1, Buffer.from(frame.data));
+  logFrame('RX', did, '503', frame.pageId, '연간압력 조각 수신', `seq=${frame.transactionSeq}/${ctx.size}`);
+  if (ctx.frags.size < ctx.size) return; // 더 받을 조각 있음
+
+  // 모든 조각 수신 → seq 순서로 결합
+  const ordered = [];
+  for (let i = 1; i <= ctx.size; i++) ordered.push(ctx.frags.get(i) || Buffer.alloc(0));
+  const pressures = decodeAnnualPressures(Buffer.concat(ordered));
+  annual503.delete(did);
+
+  try {
+    await api.postAnnualPressure({ deviceId: did, year: ctx.year, pressures });
+    await api.reportResult(ctx.commandId, { status: 'acked', resultCode: 200, resultMessage: `uploaded ${pressures.length}` });
+    logFrame('GW', did, '503', frame.pageId, '연간압력 업로드 완료', `count=${pressures.length}`);
+  } catch (e) {
+    await api.reportResult(ctx.commandId, { status: 'failed', resultCode: 500, resultMessage: e.message }).catch(() => {});
+    console.error('[API] 연간압력 업로드 실패:', e.message);
+  }
 }
 
 // ── TCP 서버 ──────────────────────────────────────────────────────────────────
-const sessions = new Map(); // deviceId → socket
-
 const tcpServer = net.createServer((socket) => {
   let buffer = Buffer.alloc(0);
   let deviceId = null;
-
-  console.log(`[TCP] 새 연결 ${socket.remoteAddress}:${socket.remotePort}`);
+  const remoteIp = socket.remoteAddress;
+  console.log(`[TCP] 새 연결 ${remoteIp}:${socket.remotePort}`);
 
   socket.on('data', (chunk) => {
     buffer = Buffer.concat([buffer, chunk]);
-
     while (buffer.length > 0) {
-      const start = buffer.indexOf(0x40); // '@'
-      if (start === -1) {
-        buffer = Buffer.alloc(0);
-        break;
-      }
+      const start = buffer.indexOf(0x40);
+      if (start === -1) { buffer = Buffer.alloc(0); break; }
       if (start > 0) buffer = buffer.slice(start);
-
-      const end = buffer.indexOf(0x21, 1); // '!'
+      const end = buffer.indexOf(0x21, 1);
       if (end === -1) break;
-
       const frameBuf = buffer.slice(0, end + 1);
       buffer = buffer.slice(end + 1);
 
       try {
         const frame = parseFrame(frameBuf);
+        const firstFrameForSession = !deviceId;
         deviceId = frame.deviceId;
         sessions.set(deviceId, socket);
 
-        logFrame(
-          'RX',
-          deviceId,
-          frame.functionCode,
-          frame.pageId,
-          '프레임 수신',
-          `requestType=${frame.requestType} addrType=${frame.addressType} checksumOk=${frame.checksumOk}`,
-        );
+        logFrame('RX', deviceId, frame.functionCode, frame.pageId, '프레임 수신',
+          `tx=${frame.transactionId} reqType=${frame.requestType} addr=${frame.addressType} csum=${frame.checksumOk}`);
         logRaw('RX frame', frameBuf);
+
+        // 장비 dial-in: 첫 프레임에서 접속 상태 보고 + 대기 명령 flush
+        if (firstFrameForSession) {
+          void api.postDeviceStatus({ deviceId, status: 'online', ip: remoteIp })
+            .catch((e) => console.error('[API] device-status(online) 실패:', e.message));
+          flushPending(deviceId, socket);
+        }
+
+        // 이전에 보낸 명령에 대한 장비 응답이면 결과 보고 후 종료
+        if (frame.requestType === '3' && resolveCommandResult(frame)) {
+          continue;
+        }
+
+        let payload = null;
+        if (frame.addressType === 'J' && frame.dataLength > 0) {
+          try { payload = JSON.parse(frame.data.toString('utf8')); }
+          catch (e) { console.warn('JSON parse error:', e.message); }
+        }
 
         const db = loadDb();
 
-        // JSON 페이로드 파싱 (addressType=J)
-        let payload = null;
-        if (frame.addressType === 'J' && frame.dataLength > 0) {
-          try {
-            payload = JSON.parse(frame.data.toString('utf8'));
-          } catch (e) {
-            console.warn('JSON parse error:', e.message);
-          }
-        }
-
-        if (payload) {
-          console.log(
-            `[GW] payload ${deviceId} ${frame.functionCode}/${frame.pageId} ${JSON.stringify(payload)}`,
-          );
-        }
-
-        const tag = `[${deviceId}] FC=${frame.functionCode}`;
-
         if (frame.functionCode === '700' && payload) {
           const receivedAt = new Date().toISOString();
-          const record = { deviceId, ...payload, receivedAt };
-          db.history.push(record);
+          db.history.push({ deviceId, ...payload, receivedAt });
           if (db.history.length > 2000) db.history = db.history.slice(-2000);
-
-          // Device 마스터 갱신
-          if (!db.devices[deviceId])
-            db.devices[deviceId] = {
-              device_id: deviceId,
-              created_at: receivedAt,
-            };
-          Object.assign(db.devices[deviceId], {
-            ...payload,
-            connected: true,
-            last_status_datetime: receivedAt,
-            last_pt_cur: payload.PTcur,
-            last_p_con: payload.Pcon,
-            last_pe_cur: payload.PEcur,
-            last_operation_status: payload.operationStatus,
-            last_operation: payload.operation,
-            last_status_code: payload.statusCode,
-          });
+          if (!db.devices[deviceId]) db.devices[deviceId] = { device_id: deviceId, created_at: receivedAt };
+          Object.assign(db.devices[deviceId], { ...payload, connected: true, last_status_datetime: receivedAt });
           saveDb(db);
 
-          // CSV / PG 저장 (Page 700 전체 필드)
-          const csvData = {
-            device_id: deviceId,
-            status_datetime: payload.statusDatetime,
-            received_at: receivedAt,
-            pt_cur: payload.PTcur,
-            pt_b: payload.PTb,
-            pt_b_datetime: payload.PTb_datetime,
-            p_con: payload.Pcon,
-            p_con_datetime: payload.Pcon_datetime,
-            p_con_init: payload.Pcon_init,
-            pe_cur: payload.PEcur,
-            operation_status: payload.operationStatus,
-            operation: payload.operation,
-            remain_time_minutes: payload.remainTimeMinutes,
-            remain_time_seconds: payload.remainTimeSeconds,
-            status_code: payload.statusCode,
-            data_cycle: payload.dataCycle,
-            data_cycle_unit: payload.dataCycleUnit,
-            network_cycle: payload.networkCycle,
-            network_cycle_unit: payload.networkCycleUnit,
-            moter_up: payload.moterUp,
-            moter_down: payload.moterDown,
-            moter_action: payload.moterAction,
-            operation_mode: payload.operationMode,
-          };
-          const csvHeaders = Object.keys(csvData);
-          appendToCsv('device_data.csv', csvHeaders, csvData);
-          void saveDataToPostgres(csvData);
-          void upsertDevice(deviceId, payload, receivedAt);
+          const row = mapPage700ToDeviceData(deviceId, payload, receivedAt);
+          appendToCsv('device_data.csv', Object.keys(row), row);
+          void saveDeviceDataToPostgres(row);
+          logFrame('RX', deviceId, '700', frame.pageId, 'Page700 저장완료',
+            `pressure=${row.pressure} op=${row.operation_status} ${pgReady ? 'pg-on' : 'pg-off'}`);
 
-          const pgState = pgReady ? 'pg-on' : 'pg-off';
-          logFrame(
-            'RX',
-            deviceId,
-            frame.functionCode,
-            frame.pageId,
-            'Page700 저장완료',
-            `PTcur=${payload.PTcur} Op=${payload.operation} ${pgState}`,
-          );
         } else if (frame.functionCode === '701' && payload) {
           const receivedAt = new Date().toISOString();
-          if (!db.devices[deviceId])
-            db.devices[deviceId] = { device_id: deviceId };
-          db.devices[deviceId].lastAlarm = { ...payload, receivedAt };
           db.alarms = db.alarms || [];
           db.alarms.push({ deviceId, ...payload, receivedAt });
           if (db.alarms.length > 5000) db.alarms = db.alarms.slice(-5000);
           saveDb(db);
 
-          // CSV 저장
-          const csvData = {
-            device_id: deviceId,
-            alarm_datetime: payload.alarmDatetime,
-            alarm_type: payload.alarmType,
-            alarm_code: payload.alarmCode,
-            received_at: receivedAt,
-          };
-          appendToCsv('device_alarm.csv', Object.keys(csvData), csvData);
-          void saveAlarmToPostgres(csvData);
-
-          const pgState = pgReady ? 'pg-on' : 'pg-off';
-          logFrame(
-            'RX',
+          // 701 알람은 API 경유 (DB 직접 INSERT 아님) — KST→ISO 변환 후 전달
+          void api.postAlarm({
             deviceId,
-            frame.functionCode,
-            frame.pageId,
-            'Page701 알람 저장완료',
-            `type=${payload.alarmType} code=${payload.alarmCode} ${pgState}`,
-          );
+            alarmDatetime: kstToIso(payload.alarmDatetime) || new Date().toISOString(),
+            alarmType: payload.alarmType,
+            alarmCode: payload.alarmCode,
+            branchId: payload.branchId,
+          }).then((r) => logFrame('GW', deviceId, '701', frame.pageId, '알람 API 전달', `status=${r.status}`))
+            .catch((e) => console.error('[API] 알람 전달 실패:', e.message));
+
+        } else if (frame.functionCode === '503') {
+          void handle503Response(frame);
         } else if (frame.functionCode === '103') {
           logFrame('RX', deviceId, frame.functionCode, frame.pageId, 'Ping');
         } else {
-          logFrame(
-            'RX',
-            deviceId,
-            frame.functionCode,
-            frame.pageId,
-            '기타 프레임',
-            `checksumOk=${frame.checksumOk}`,
-          );
+          logFrame('RX', deviceId, frame.functionCode, frame.pageId, '기타 프레임', `csum=${frame.checksumOk}`);
         }
 
-        // requestType=1 이면 ACK
+        // 장비가 응답을 요구(requestType=1)하면 ACK
         if (frame.requestType === '1') {
-          logFrame(
-            'TX',
-            deviceId,
-            frame.functionCode,
-            frame.pageId,
-            'ACK 전송 예정',
-            `requestType=${frame.requestType}`,
-          );
           socket.write(buildAck(frameBuf, 200));
+          logFrame('TX', deviceId, frame.functionCode, frame.pageId, 'ACK 송신');
         }
       } catch (e) {
         console.error('[TCP] 파싱 오류:', e.message);
@@ -605,34 +366,24 @@ const tcpServer = net.createServer((socket) => {
     if (deviceId) {
       sessions.delete(deviceId);
       logFrame('TCP', deviceId, '-', '-', '연결 종료');
+      void api.postDeviceStatus({ deviceId, status: 'offline', ip: remoteIp })
+        .catch((e) => console.error('[API] device-status(offline) 실패:', e.message));
       const db = loadDb();
-      if (db.devices[deviceId]) {
-        db.devices[deviceId].connected = false;
-        saveDb(db);
-      }
-      void setDeviceDisconnected(deviceId);
+      if (db.devices[deviceId]) { db.devices[deviceId].connected = false; saveDb(db); }
     }
   });
 
   socket.on('error', (e) => console.error('[TCP] 소켓 오류:', e.message));
 });
 
-tcpServer.listen(TCP_PORT, () => {
-  logInfo(`TCP Gateway listening on :${TCP_PORT}`);
-});
+tcpServer.listen(TCP_PORT, () => logInfo(`TCP Gateway listening on :${TCP_PORT}`));
 
-// ── HTTP API ─────────────────────────────────────────────────────────────────
+// ── HTTP API (로컬 조회/디버그) ───────────────────────────────────────────────
 function parseBody(req) {
   return new Promise((resolve) => {
     let body = '';
     req.on('data', (c) => (body += c));
-    req.on('end', () => {
-      try {
-        resolve(JSON.parse(body));
-      } catch {
-        resolve({});
-      }
-    });
+    req.on('end', () => { try { resolve(JSON.parse(body)); } catch { resolve({}); } });
   });
 }
 
@@ -641,110 +392,41 @@ const httpServer = http.createServer(async (req, res) => {
   res.setHeader('Access-Control-Allow-Methods', 'GET, POST, DELETE, OPTIONS');
   res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
   res.setHeader('Content-Type', 'application/json');
-
-  if (req.method === 'OPTIONS') {
-    res.end('{}');
-    return;
-  }
+  if (req.method === 'OPTIONS') { res.end('{}'); return; }
 
   const url = new URL(req.url, 'http://localhost');
   const db = loadDb();
 
   if (url.pathname === '/api/history' && req.method === 'GET') {
     const deviceId = url.searchParams.get('deviceId');
-    const list = deviceId
-      ? db.history.filter((h) => h.deviceId === deviceId)
-      : db.history;
+    const list = deviceId ? db.history.filter((h) => h.deviceId === deviceId) : db.history;
     res.end(JSON.stringify(list.slice(-100)));
   } else if (url.pathname === '/api/devices' && req.method === 'GET') {
     res.end(JSON.stringify(db.devices));
-  } else if (
-    url.pathname.match(/^\/api\/devices\/([^/]+)\/control$/) &&
-    req.method === 'POST'
-  ) {
-    const deviceId = url.pathname.match(
-      /^\/api\/devices\/([^/]+)\/control$/,
-    )[1];
+  } else if (url.pathname === '/api/sessions' && req.method === 'GET') {
+    res.end(JSON.stringify({ connected: [...sessions.keys()], pending: [...pendingByDevice.keys()] }));
+  } else if (url.pathname.match(/^\/api\/devices\/([^/]+)\/control$/) && req.method === 'POST') {
+    // 디버그용 직접 제어: 장비가 접속 중일 때 즉시 300 전송 (정식 경로는 API 명령 큐)
+    const did = url.pathname.match(/^\/api\/devices\/([^/]+)\/control$/)[1];
     const body = await parseBody(req);
-    const operation = body.operation; // '1': 운전, '2': 정지
-
-    logFrame(
-      'HTTP',
-      deviceId,
-      '300',
-      '00',
-      '제어 요청 수신',
-      `operation=${operation}`,
-    );
-
+    const operation = body.operation;
     if (!operation || !['1', '2'].includes(operation)) {
-      res.statusCode = 400;
-      res.end(JSON.stringify({ error: 'invalid operation' }));
-      return;
+      res.statusCode = 400; res.end(JSON.stringify({ error: 'invalid operation' })); return;
     }
-
-    const socket = sessions.get(deviceId);
-    if (!socket) {
-      res.statusCode = 404;
-      res.end(JSON.stringify({ error: 'device not connected' }));
-      return;
-    }
-
-    try {
-      const frame = buildControlFrame({ deviceId, operation });
-      socket.write(frame);
-      logRaw('TX control frame', frame);
-
-      // 명령 로그 저장
-      const commandData = {
-        device_id: deviceId,
-        function_code: '300',
-        operation,
-        sent_at: new Date().toISOString(),
-        status: 'sent',
-      };
-      db.commands = db.commands || [];
-      db.commands.push(commandData);
-      if (db.commands.length > 1000) db.commands = db.commands.slice(-1000);
-      saveDb(db);
-
-      // CSV 저장
-      appendToCsv(
-        'device_command.csv',
-        ['device_id', 'function_code', 'operation', 'sent_at', 'status'],
-        commandData,
-      );
-      void saveCommandToPostgres(commandData);
-
-      res.end(
-        JSON.stringify({
-          ok: true,
-          message: `제어 명령 전송: operation=${operation}`,
-        }),
-      );
-      logFrame(
-        'HTTP',
-        deviceId,
-        '300',
-        '00',
-        '제어 명령 전송 완료',
-        `operation=${operation}`,
-      );
-    } catch (e) {
-      res.statusCode = 500;
-      res.end(JSON.stringify({ error: e.message }));
-    }
+    const socket = sessions.get(did);
+    if (!socket) { res.statusCode = 404; res.end(JSON.stringify({ error: 'device not connected' })); return; }
+    sendCommand({ commandId: 0, deviceId: did, functionCode: '300', transactionId: Math.floor(Math.random() * 10000), payload: { requestType: '00', operation } }, socket);
+    res.end(JSON.stringify({ ok: true, message: `제어 전송(디버그): operation=${operation}` }));
   } else if (url.pathname === '/api/clear' && req.method === 'POST') {
     saveDb({ devices: {}, history: [], alarms: [], commands: [] });
     res.end('{"ok":true}');
   } else {
-    res.statusCode = 404;
-    res.end('{"error":"not found"}');
+    res.statusCode = 404; res.end('{"error":"not found"}');
   }
 });
 
 initPostgres().finally(() => {
-  httpServer.listen(HTTP_PORT, () => {
-    logInfo(`HTTP API listening on :${HTTP_PORT}`);
-  });
+  httpServer.listen(HTTP_PORT, () => logInfo(`HTTP API listening on :${HTTP_PORT}`));
+  setInterval(pollOnce, POLL_INTERVAL_MS);
+  logInfo(`명령 큐 polling 시작 (interval=${POLL_INTERVAL_MS}ms, API=${api.API_BASE_URL})`);
 });
